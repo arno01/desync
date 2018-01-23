@@ -5,6 +5,7 @@ import (
 	"crypto/sha512"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sync"
 )
@@ -52,7 +53,8 @@ func IndexFromFile(ctx context.Context,
 			return index, err
 		}
 		defer f.Close()
-		start := span * uint64(i)       // starting position for this chunker
+		start := span * uint64(i) // starting position for this chunker
+		log.Printf("worker%d - starting at pos %d", i, start)
 		mChunks := (size-start)/min + 1 // max # of chunks this worker can produce
 		s, err := f.Seek(int64(start), io.SeekStart)
 		if err != nil {
@@ -66,6 +68,7 @@ func IndexFromFile(ctx context.Context,
 			return index, err
 		}
 		p := &pChunker{
+			id:      i,
 			chunker: c,
 			results: make(chan IndexChunk, mChunks),
 			done:    make(chan struct{}),
@@ -90,10 +93,13 @@ func IndexFromFile(ctx context.Context,
 	// reaches the end of the stream before the following worker does (eof=true),
 	// don't advance to the next worker in that case.
 	for _, w := range worker {
+		var n int
 		for chunk := range w.results {
 			// Assemble the list of chunks in the index
 			index.Chunks = append(index.Chunks, chunk)
+			n++
 		}
+		log.Printf("assembler read %d chunks from worker%d", n, w.id)
 		// Done reading all chunks from this worker, check for any errors
 		if w.err != nil {
 			return index, w.err
@@ -101,6 +107,7 @@ func IndexFromFile(ctx context.Context,
 		// Stop if this worker reached the end of the stream (it's not necessarily
 		// the last worker!)
 		if w.eof {
+			log.Printf("worker%d reached eof - chunking complete", w.id)
 			break
 		}
 	}
@@ -127,10 +134,12 @@ type pChunker struct {
 	next *pChunker
 	eof  bool
 	sync IndexChunk
+	id   int
 }
 
 func (c *pChunker) start(ctx context.Context) {
 	defer close(c.results)
+	defer log.Printf("worker%d stopping", c.id)
 	for {
 		select {
 		case <-ctx.Done():
@@ -163,6 +172,7 @@ func (c *pChunker) start(ctx context.Context) {
 		// Check if the next worker already has this chunk, at which point we stop
 		// here and let the next continue
 		if c.next != nil && c.next.syncWith(chunk) {
+			log.Printf("worker%d found sync with worker%d at pos %d", c.id, c.next.id, start)
 			return
 		}
 	}
