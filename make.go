@@ -139,6 +139,7 @@ type pChunker struct {
 
 func (c *pChunker) start(ctx context.Context) {
 	defer close(c.results)
+	defer c.stop()
 	defer log.Printf("worker%d stopping", c.id)
 	for {
 		select {
@@ -160,6 +161,7 @@ func (c *pChunker) start(ctx context.Context) {
 			// last one, we should probable stop all following workers. Meh, shouldn't
 			// be happening for large file or save significant CPU for small ones.
 			c.eof = true
+			log.Printf("worker%d hit eof", c.id)
 			return
 		}
 		// Calculate the chunk ID
@@ -175,6 +177,13 @@ func (c *pChunker) start(ctx context.Context) {
 			log.Printf("worker%d found sync with worker%d at pos %d", c.id, c.next.id, start)
 			return
 		}
+
+		// If the next worker has stopped and has no more chunks in its bucket,
+		// we want to skip that and try to sync with the one after
+		if c.next != nil && !c.next.active() && len(c.next.results) == 0 {
+			log.Printf("worker%d found worker%d to be inactive and empty, skipping over", c.id, c.next.id)
+			c.next = c.next.next
+		}
 	}
 }
 
@@ -182,13 +191,26 @@ func (c *pChunker) stop() {
 	c.once.Do(func() { close(c.done) })
 }
 
+func (c *pChunker) active() bool {
+	select {
+	case <-c.done:
+		return false
+	default:
+		return true
+	}
+}
+
 // Returns true if the given chunk lines up with one in the current bucket
 func (c *pChunker) syncWith(chunk IndexChunk) bool {
 	// Read from our bucket until we're past (or match) where the previous worker
 	// currently is
 	for chunk.Start > c.sync.Start {
+		var ok bool
 		select {
-		case c.sync = <-c.results:
+		case c.sync, ok = <-c.results:
+			if !ok {
+				return false
+			}
 		default: // Nothing in my bucket? Move on
 			return false
 		}
